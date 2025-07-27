@@ -32,9 +32,11 @@ app = Flask(__name__)
 CORS(app)
 
 class TaskStatus:
-    def __init__(self, task_id: str, task: str):
+    def __init__(self, task_id: str, task: str, original_task: str = None):
         self.id = task_id
         self.task = task
+        self.original_task = original_task  # For feedback tasks, stores the original task description
+        self.feedback_history = []  # Array of feedback rounds for this task chain
         self.status = "running"
         self.start_time = datetime.now()
         self.end_time = None
@@ -42,11 +44,78 @@ class TaskStatus:
         self.error = ""
         self.return_code = None
         self.temp_dir = None
+        self.session_id = None
 
 class TaskServer:
     def __init__(self):
         self.tasks: Dict[str, TaskStatus] = {}
         self.lock = threading.Lock()
+    
+    def process_claude_message(self, message, task_id: str) -> Dict[str, str]:
+        """Process a Claude message and return formatted message data"""
+        message_data = {}
+
+        match type(message).__name__:
+            case "SystemMessage":
+                message_data["type"] = "SystemMessage"
+                message_data["content"] = str(message.data)
+            case "ResultMessage":
+                message_data["type"] = "ResultMessage"
+                # Capture session ID if available
+                if hasattr(message, 'session_id') and message.session_id:
+                    with self.lock:
+                        self.tasks[task_id].session_id = message.session_id
+                # Format result message as readable text
+                result_parts = []
+                if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
+                    result_parts.append(f"Cost: ${message.total_cost_usd:.4f}")
+                if hasattr(message, 'duration_ms') and message.duration_ms:
+                    result_parts.append(f"Duration: {message.duration_ms}ms")
+                if hasattr(message, 'num_turns') and message.num_turns:
+                    result_parts.append(f"Turns: {message.num_turns}")
+                if hasattr(message, 'is_error') and message.is_error:
+                    result_parts.append("Status: Error")
+                else:
+                    result_parts.append("Status: Success")
+                current_session = self.tasks[task_id].session_id
+                if current_session:
+                    result_parts.append(f"Session: {current_session}")
+                message_data["content"] = " | ".join(result_parts)
+
+            case "UserMessage":
+                message_data["type"] = "UserMessage"
+                message_data["content"] = str(message.content)
+            
+            case "AssistantMessage":
+                message_data["type"] = "AssistantMessage"
+                content_data = []
+                for block in message.content:
+                    match type(block).__name__:
+                        case "TextBlock":
+                            content_data.append(block.text)
+                        case "ToolUseBlock":
+                            # Format tool use more clearly without interfering with code blocks
+                            tool_input = str(block.input) if hasattr(block, 'input') else ""
+                            content_data.append(f"🔧 Using tool: {block.name}")
+                            if block.name == "Write" and hasattr(block, 'input') and 'file_path' in block.input:
+                                file_path = block.input.get('file_path', 'unknown')
+                                content_data.append(f"📝 Writing file: {file_path}")
+                            elif tool_input and len(tool_input) < 200:
+                                content_data.append(f"Input: {tool_input}")
+                        case "ToolResultBlock":
+                            if block.is_error:
+                                content_data.append(f"❌ Tool Error: {block.content}")
+                            else:
+                                # Limit tool result output to prevent overwhelming display
+                                result_content = str(block.content)
+                                if len(result_content) > 500:
+                                    result_content = result_content[:500] + "... (truncated)"
+                                content_data.append(f"✅ Tool Result: {result_content}")
+                        case _:
+                            content_data.append(str(block))
+                message_data["content"] = "\n".join(content_data)
+        
+        return message_data
     
     def execute_task(self, task: str, repository: str = None) -> str:
         task_id = str(uuid.uuid4())
@@ -84,66 +153,11 @@ class TaskServer:
                         cwd=temp_dir,
                         permission_mode="bypassPermissions"
                     )
-                    messages = []
                     
                     try:
+                        messages = []
                         async for message in claude_code_sdk.query(prompt=task, options=options):
-                            # Capture message type and content for better rendering
-                            message_data = {}
-
-                            match type(message).__name__:
-                                case "SystemMessage":
-                                    message_data["type"] = "SystemMessage"
-                                    message_data["content"] = str(message.data)
-                                case "ResultMessage":
-                                    message_data["type"] = "ResultMessage"
-                                    # Format result message as readable text
-                                    result_parts = []
-                                    if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
-                                        result_parts.append(f"Cost: ${message.total_cost_usd:.4f}")
-                                    if hasattr(message, 'duration_ms') and message.duration_ms:
-                                        result_parts.append(f"Duration: {message.duration_ms}ms")
-                                    if hasattr(message, 'num_turns') and message.num_turns:
-                                        result_parts.append(f"Turns: {message.num_turns}")
-                                    if hasattr(message, 'is_error') and message.is_error:
-                                        result_parts.append("Status: Error")
-                                    else:
-                                        result_parts.append("Status: Success")
-                                    message_data["content"] = " | ".join(result_parts)
-
-                                case "UserMessage":
-                                    message_data["type"] = "UserMessage"
-                                    message_data["content"] = str(message.content)
-                                
-                                case "AssistantMessage":
-                                    message_data["type"] = "AssistantMessage"
-                                    content_data = []
-                                    for block in message.content:
-                                        match type(block).__name__:
-                                            case "TextBlock":
-                                                content_data.append(block.text)
-                                            case "ToolUseBlock":
-                                                # Format tool use more clearly without interfering with code blocks
-                                                tool_input = str(block.input) if hasattr(block, 'input') else ""
-                                                content_data.append(f"🔧 Using tool: {block.name}")
-                                                if block.name == "Write" and hasattr(block, 'input') and 'file_path' in block.input:
-                                                    file_path = block.input.get('file_path', 'unknown')
-                                                    content_data.append(f"📝 Writing file: {file_path}")
-                                                elif tool_input and len(tool_input) < 200:
-                                                    content_data.append(f"Input: {tool_input}")
-                                            case "ToolResultBlock":
-                                                if block.is_error:
-                                                    content_data.append(f"❌ Tool Error: {block.content}")
-                                                else:
-                                                    # Limit tool result output to prevent overwhelming display
-                                                    result_content = str(block.content)
-                                                    if len(result_content) > 500:
-                                                        result_content = result_content[:500] + "... (truncated)"
-                                                    content_data.append(f"✅ Tool Result: {result_content}")
-                                            case _:
-                                                content_data.append(str(block))
-                                    message_data["content"] = "\n".join(content_data)
-                            
+                            message_data = self.process_claude_message(message, task_id)
                             messages.append(message_data)
                         
                         logger.info(f"Task {task_id}: SDK execution completed successfully")
@@ -151,7 +165,6 @@ class TaskServer:
                         
                     except CLIJSONDecodeError as e:
                         logger.error(f"Task {task_id}: Claude SDK JSON decode error: {str(e)}")
-                        # Return a structured error message for JSON decode issues
                         return [{
                             "type": "ErrorMessage",
                             "content": f"Claude SDK communication error: {str(e)}\n\nThis appears to be a temporary issue with the Claude Code SDK. You can try running the task again."
@@ -209,13 +222,16 @@ class TaskServer:
             return {
                 "id": task.id,
                 "task": task.task,
+                "original_task": task.original_task,
+                "feedback_history": task.feedback_history,
                 "status": task.status,
                 "start_time": task.start_time.isoformat(),
                 "end_time": task.end_time.isoformat() if task.end_time else None,
                 "output": task.output,
                 "error": task.error,
                 "return_code": task.return_code,
-                "temp_dir": task.temp_dir
+                "temp_dir": task.temp_dir,
+                "session_id": task.session_id
             }
     
     def list_tasks(self) -> List[Dict]:
@@ -573,6 +589,106 @@ This PR includes the modifications made to fulfill the requested task.
             logger.error(f"Error creating pull request for task {task_id}: {e}", exc_info=True)
             return {"error": f"Failed to create pull request: {str(e)}", "success": False}
 
+    def execute_feedback(self, task_id: str, feedback: str, session_id: str) -> Dict:
+        """Execute feedback using Claude Code SDK with session resumption"""
+        logger.info(f"Executing feedback for task {task_id} with session {session_id}")
+        
+        with self.lock:
+            if task_id not in self.tasks:
+                logger.warning(f"Task not found for feedback: {task_id}")
+                return {"error": "Task not found", "success": False}
+            
+            task_status = self.tasks[task_id]
+        
+        temp_dir = task_status.temp_dir
+        
+        if not temp_dir or not os.path.exists(temp_dir):
+            return {"error": "Task directory not found", "success": False}
+        
+        # Create a new task for the feedback continuation
+        feedback_task_id = str(uuid.uuid4())
+        
+        # Determine original task and build feedback history
+        original_task = task_status.original_task or task_status.task
+        feedback_history = task_status.feedback_history.copy() if task_status.feedback_history else []
+        feedback_history.append({
+            "feedback": feedback,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        feedback_task_status = TaskStatus(feedback_task_id, f"Feedback: {feedback}", original_task)
+        feedback_task_status.feedback_history = feedback_history
+        feedback_task_status.temp_dir = temp_dir
+        feedback_task_status.session_id = session_id
+        
+        with self.lock:
+            self.tasks[feedback_task_id] = feedback_task_status
+        
+        def run_feedback_task():
+            try:
+                logger.info(f"Feedback task {feedback_task_id}: Starting Claude Code SDK execution with session resumption")
+                
+                async def execute_claude_feedback():
+                    options = claude_code_sdk.ClaudeCodeOptions(
+                        cwd=temp_dir,
+                        permission_mode="bypassPermissions",
+                        resume=session_id,
+                        continue_conversation=True
+                    )
+                    
+                    try:
+                        messages = []
+                        async for message in claude_code_sdk.query(prompt=feedback, options=options):
+                            message_data = self.process_claude_message(message, feedback_task_id)
+                            messages.append(message_data)
+                        
+                        logger.info(f"Feedback task {feedback_task_id}: SDK execution completed successfully")
+                        return messages
+                        
+                    except CLIJSONDecodeError as e:
+                        logger.error(f"Feedback task {feedback_task_id}: Claude SDK JSON decode error: {str(e)}")
+                        return [{
+                            "type": "ErrorMessage",
+                            "content": f"Claude SDK communication error: {str(e)}\n\nThis appears to be a temporary issue with the Claude Code SDK. You can try running the task again."
+                        }]
+                    except Exception as e:
+                        logger.error(f"Feedback task {feedback_task_id}: Unexpected error: {str(e)}", exc_info=True)
+                        return [{
+                            "type": "ErrorMessage",
+                            "content": f"Unexpected error: {str(e)}"
+                        }]
+                
+                # Run the async function
+                messages = asyncio.run(execute_claude_feedback())
+                
+                # Store the output
+                with self.lock:
+                    feedback_task_status.output = json.dumps(messages)
+                    feedback_task_status.status = "completed"
+                    feedback_task_status.end_time = datetime.now()
+                    feedback_task_status.return_code = 0
+                
+                logger.info(f"Feedback task {feedback_task_id}: Task completed successfully")
+                
+            except Exception as e:
+                logger.error(f"Feedback task {feedback_task_id}: Error during execution: {str(e)}", exc_info=True)
+                with self.lock:
+                    feedback_task_status.error = str(e)
+                    feedback_task_status.status = "failed"
+                    feedback_task_status.end_time = datetime.now()
+                    feedback_task_status.return_code = 1
+        
+        # Run the feedback task in a thread
+        thread = threading.Thread(target=run_feedback_task)
+        thread.daemon = True
+        thread.start()
+        
+        return {
+            "success": True,
+            "feedback_task_id": feedback_task_id,
+            "message": "Feedback submitted successfully and is being processed"
+        }
+
 server = TaskServer()
 
 @app.route('/execute', methods=['POST'])
@@ -716,6 +832,40 @@ def create_pr(task_id):
             
     except Exception as e:
         logger.error(f"Error in create_pr endpoint for task {task_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/feedback/<task_id>', methods=['POST'])
+def send_feedback(task_id):
+    try:
+        data = request.get_json()
+        logger.info(f"Feedback request for task: {task_id}")
+        
+        if not data:
+            return jsonify({"error": "Request body required"}), 400
+        
+        feedback = data.get('feedback')
+        if not feedback:
+            return jsonify({"error": "Feedback text is required"}), 400
+        
+        # Get the task to retrieve session_id
+        task_status = server.get_task_status(task_id)
+        if not task_status:
+            return jsonify({"error": "Task not found"}), 404
+        
+        session_id = task_status.get('session_id')
+        if not session_id:
+            return jsonify({"error": "No session ID found for this task"}), 400
+        
+        # Execute feedback with session resumption
+        result = server.execute_feedback(task_id, feedback, session_id)
+        
+        if result.get('success'):
+            return jsonify(result)
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        logger.error(f"Error in feedback endpoint for task {task_id}: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':

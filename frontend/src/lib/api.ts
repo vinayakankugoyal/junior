@@ -1,5 +1,10 @@
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
 
+export interface FeedbackHistoryItem {
+  feedback: string;
+  timestamp: string;
+}
+
 export interface Task {
   id: string;
   task: string;
@@ -10,6 +15,9 @@ export interface Task {
   error?: string;
   return_code: number | null;
   temp_dir?: string;
+  session_id?: string;
+  original_task?: string; // For feedback tasks, stores the original task description
+  feedback_history?: FeedbackHistoryItem[]; // Array of feedback rounds
 }
 
 export interface TaskListResponse {
@@ -55,6 +63,17 @@ export interface CreatePRResponse {
   pr_number?: number;
   branch_name?: string;
   message?: string;
+  error?: string;
+}
+
+export interface FeedbackRequest {
+  feedback: string;
+}
+
+export interface FeedbackResponse {
+  success: boolean;
+  feedback_task_id: string;
+  message: string;
   error?: string;
 }
 
@@ -153,6 +172,23 @@ class ApiClient {
 
   async createPullRequest(taskId: string, request: CreatePRRequest): Promise<CreatePRResponse> {
     const response = await fetch(`${this.baseUrl}/create-pr/${taskId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+    }
+
+    return response.json();
+  }
+
+  async sendFeedback(taskId: string, request: FeedbackRequest): Promise<FeedbackResponse> {
+    const response = await fetch(`${this.baseUrl}/feedback/${taskId}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

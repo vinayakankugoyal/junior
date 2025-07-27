@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { useSession } from 'next-auth/react';
-import { Task, TaskFile, TaskContentResponse, CreatePRRequest, apiClient } from '@/lib/api';
+import { Task, TaskFile, TaskContentResponse, CreatePRRequest, FeedbackRequest, FeedbackHistoryItem, apiClient } from '@/lib/api';
 import { usePolling } from '@/hooks/usePolling';
 import { parseDiff, Diff, Hunk } from 'react-diff-view';
 import 'react-diff-view/style/index.css';
@@ -27,6 +27,11 @@ export default function TaskDetails({ task, onClose, onTaskDeleted }: TaskDetail
   const [creatingPR, setCreatingPR] = useState(false);
   const [prTitle, setPrTitle] = useState('');
   const [prBody, setPrBody] = useState('');
+  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+  const [feedback, setFeedback] = useState('');
+  const [sendingFeedback, setSendingFeedback] = useState(false);
+  const [showFeedbackSuccess, setShowFeedbackSuccess] = useState(false);
+  const [feedbackTaskId, setFeedbackTaskId] = useState<string | null>(null);
 
   useEffect(() => {
     setIsMounted(true);
@@ -144,7 +149,41 @@ export default function TaskDetails({ task, onClose, onTaskDeleted }: TaskDetail
     }
   };
 
-  usePolling(refreshTask, {
+  const silentRefreshTask = async () => {
+    if (!currentTask?.id || !isMounted) return;
+
+    try {
+      const updatedTask = await apiClient.getTaskStatus(currentTask.id);
+      if (isMounted) {
+        // Only update if there are meaningful changes
+        const hasChanges = 
+          updatedTask.status !== currentTask.status ||
+          updatedTask.end_time !== currentTask.end_time ||
+          updatedTask.output !== currentTask.output ||
+          updatedTask.error !== currentTask.error ||
+          JSON.stringify(updatedTask.feedback_history) !== JSON.stringify(currentTask.feedback_history);
+
+        if (hasChanges) {
+          setCurrentTask(updatedTask);
+          
+          // Only refresh content if status changed to completed/failed
+          if (updatedTask.status !== currentTask.status && 
+              (updatedTask.status === 'completed' || updatedTask.status === 'failed')) {
+            try {
+              await fetchTaskData();
+            } catch (dataErr) {
+              console.warn('Failed to refresh task data:', dataErr);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh task silently:', err);
+      // Don't show error for silent refresh
+    }
+  };
+
+  usePolling(silentRefreshTask, {
     interval: 1000,
     enabled: currentTask?.status === 'running'
   });
@@ -253,6 +292,63 @@ This PR includes the modifications made to fulfill the requested task.
     setPrBody('');
   };
 
+  const handleFeedback = () => {
+    setShowFeedbackModal(true);
+  };
+
+  const sendFeedback = async () => {
+    if (!currentTask?.id || !feedback.trim()) return;
+
+    setSendingFeedback(true);
+    setError(null);
+
+    try {
+      const request: FeedbackRequest = {
+        feedback: feedback.trim(),
+      };
+
+      const response = await apiClient.sendFeedback(currentTask.id, request);
+      
+      if (response.success) {
+        // Close the modal
+        setShowFeedbackModal(false);
+        setFeedback('');
+        
+        // Show success modal
+        setFeedbackTaskId(response.feedback_task_id);
+        setShowFeedbackSuccess(true);
+        
+        // Create a new processing task to show in the UI
+        const feedbackTask: Task = {
+          id: response.feedback_task_id,
+          task: `Feedback: ${request.feedback}`,
+          status: 'running',
+          start_time: new Date().toISOString(),
+          end_time: null,
+          return_code: null,
+          session_id: currentTask.session_id
+        };
+        
+        // Update current task to the feedback task to show processing
+        setCurrentTask(feedbackTask);
+        setTaskContent(null); // Reset content for new task
+        
+        // Start polling for the new feedback task
+        // The usePolling hook will automatically start polling since status is 'running'
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to send feedback';
+      setError(errorMessage);
+    } finally {
+      setSendingFeedback(false);
+    }
+  };
+
+  const cancelFeedback = () => {
+    setShowFeedbackModal(false);
+    setFeedback('');
+  };
+
   const formatTime = (timeString: string) => {
     return new Date(timeString).toLocaleString();
   };
@@ -302,6 +398,15 @@ This PR includes the modifications made to fulfill the requested task.
             >
               {loading ? 'Refreshing...' : 'Refresh'}
             </button>
+            {currentTask?.session_id && (currentTask?.status === 'completed' || currentTask?.status === 'failed') && (
+              <button
+                onClick={handleFeedback}
+                disabled={sendingFeedback || loading}
+                className="px-3 py-1 text-sm text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors disabled:opacity-50"
+              >
+                {sendingFeedback ? 'Sending...' : 'Give Feedback'}
+              </button>
+            )}
             {taskContent?.is_git_repo && session?.accessToken && (currentTask?.status === 'completed' || currentTask?.status === 'failed') && (
               <button
                 onClick={handleCreatePR}
@@ -338,9 +443,38 @@ This PR includes the modifications made to fulfill the requested task.
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Task</label>
-                <div className="block w-full p-3 bg-gray-100 rounded-md text-sm text-gray-700">
-                  {currentTask.task}
-                </div>
+                {currentTask.original_task || currentTask.feedback_history?.length ? (
+                  <div className="space-y-3">
+                    <div className="block w-full p-3 bg-blue-50 border border-blue-200 rounded-md text-sm">
+                      <div className="font-medium text-blue-800 mb-2">Original Task:</div>
+                      <div className="text-gray-700">
+                        {currentTask.original_task || currentTask.task}
+                      </div>
+                    </div>
+                    {currentTask.feedback_history && currentTask.feedback_history.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="font-medium text-gray-800 text-sm">Feedback History:</div>
+                        {currentTask.feedback_history.map((feedback, index) => (
+                          <div key={index} className="block w-full p-3 bg-gray-100 rounded-md text-sm">
+                            <div className="flex justify-between items-start mb-2">
+                              <div className="font-medium text-gray-800">Feedback #{index + 1}:</div>
+                              <div className="text-xs text-gray-500">
+                                {new Date(feedback.timestamp).toLocaleString()}
+                              </div>
+                            </div>
+                            <div className="text-gray-700">
+                              {feedback.feedback}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="block w-full p-3 bg-gray-100 rounded-md text-sm text-gray-700">
+                    {currentTask.task}
+                  </div>
+                )}
               </div>
 
               <div>
@@ -356,6 +490,15 @@ This PR includes the modifications made to fulfill the requested task.
                   {currentTask.id}
                 </code>
               </div>
+
+              {currentTask.session_id && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Session ID</label>
+                  <code className="block w-full p-2 bg-gray-50 rounded text-xs font-mono text-gray-800">
+                    {currentTask.session_id}
+                  </code>
+                </div>
+              )}
             </div>
 
             <div className="space-y-4">
@@ -820,7 +963,6 @@ This PR includes the modifications made to fulfill the requested task.
                     </svg>
                     <div className="text-sm text-blue-800">
                       <p>Using your authenticated GitHub account: <span className="font-medium">{session?.user?.name || session?.user?.email}</span></p>
-                      <p className="mt-1 font-mono text-xs break-all">Token: {session?.accessToken || 'No token'}</p>
                     </div>
                   </div>
                 </div>
@@ -884,6 +1026,149 @@ This PR includes the modifications made to fulfill the requested task.
               >
                 {creatingPR ? 'Creating...' : 'Create Pull Request'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Feedback Modal */}
+      {showFeedbackModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-hidden">
+            <div className="flex justify-between items-center p-6 border-b">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
+                  <svg className="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-3.582 8-8 8a8.97 8.97 0 01-4.906-1.524A11.52 11.52 0 014.5 20.5h-.5a1 1 0 01-1-1v-.5c0-3.038 2.462-5.5 5.5-5.5h.5c-.038-.308-.038-.692 0-1H8.5c-3.038 0-5.5-2.462-5.5-5.5V7a1 1 0 011-1h.5l1.416-1.416c.078-.078.15-.165.217-.258C6.633 3.326 8.22 2 10 2s3.367 1.326 3.867 2.326c.067.093.139.18.217.258L15.5 6H16a1 1 0 011 1v.5c0 3.038-2.462 5.5-5.5 5.5H11c.038.308.038.692 0 1h.5c3.038 0 5.5 2.462 5.5 5.5v.5a1 1 0 01-1 1h-.5c-1.19 0-2.353.21-3.456.6A8.97 8.97 0 0113 20c4.418 0 8-3.582 8-8z" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Give Feedback</h3>
+                  <p className="text-sm text-gray-600">Continue the conversation with Claude</p>
+                </div>
+              </div>
+              <button
+                onClick={cancelFeedback}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <div className="p-6 overflow-y-auto max-h-[calc(90vh-200px)]">
+              {error && (
+                <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded">
+                  {error}
+                </div>
+              )}
+
+              <div className="space-y-4">
+                <div className="bg-blue-50 border border-blue-200 rounded-md p-3">
+                  <div className="flex items-center gap-2">
+                    <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="text-sm text-blue-800">
+                      <p><span className="font-medium">Session ID:</span> {currentTask?.session_id}</p>
+                      <p className="mt-1">This will continue the conversation from where the task left off.</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Your Feedback or Additional Instructions
+                  </label>
+                  <textarea
+                    value={feedback}
+                    onChange={(e) => setFeedback(e.target.value)}
+                    placeholder="Please make the following changes..."
+                    rows={6}
+                    className="text-gray-800 w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+                  />
+                </div>
+
+                <div className="bg-yellow-50 border border-yellow-200 rounded-md p-3">
+                  <div className="flex items-start gap-2">
+                    <svg className="w-5 h-5 text-yellow-600 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 15.5c-.77.833.192 2.5 1.732 2.5z" />
+                    </svg>
+                    <div className="text-sm text-yellow-800">
+                      <p className="font-medium">How this works</p>
+                      <ul className="mt-1 list-disc list-inside space-y-1">
+                        <li>Claude will resume from the exact context where the task ended</li>
+                        <li>A new task will be created to track the feedback conversation</li>
+                        <li>Changes will be made in the same working directory</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            
+            <div className="flex gap-3 justify-end p-6 border-t bg-gray-50">
+              <button
+                onClick={cancelFeedback}
+                disabled={sendingFeedback}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 rounded-md transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={sendFeedback}
+                disabled={sendingFeedback || !feedback.trim()}
+                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors disabled:opacity-50"
+              >
+                {sendingFeedback ? 'Sending...' : 'Send Feedback'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Feedback Success Modal */}
+      {showFeedbackSuccess && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full">
+            <div className="p-6">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 bg-green-100 rounded-full flex items-center justify-center">
+                  <svg className="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">Feedback Submitted</h3>
+                  <p className="text-sm text-gray-600">Your feedback is now being processed</p>
+                </div>
+              </div>
+              
+              <div className="mb-6">
+                <p className="text-gray-700 mb-3">
+                  Your feedback has been successfully submitted and a new task has been created to process it.
+                </p>
+                <div className="bg-blue-50 rounded-md p-3">
+                  <p className="text-sm font-medium text-blue-700 mb-1">New Task ID:</p>
+                  <code className="text-sm text-blue-800 font-mono break-all">{feedbackTaskId}</code>
+                </div>
+                <p className="text-sm text-gray-600 mt-3">
+                  Claude will continue the conversation from where the original task left off and make the requested changes.
+                </p>
+              </div>
+              
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => {
+                    setShowFeedbackSuccess(false);
+                    setFeedbackTaskId(null);
+                  }}
+                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors"
+                >
+                  Got it
+                </button>
+              </div>
             </div>
           </div>
         </div>
